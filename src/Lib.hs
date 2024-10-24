@@ -7,22 +7,46 @@ module Lib
   )
 where
 
-import ASCII.Char as ASCII (Char (Comma), toInt)
 import Control.Concurrent (forkFinally)
 import qualified Control.Exception as E
-import Control.Monad (forever, void)
-import Data.Attoparsec.ByteString as AB
-import Data.Attoparsec.ByteString.Char8 as AC
-import Data.ByteString
+import Control.Monad (forever, void, when)
+import Data.Attoparsec.ByteString as AB ( IResult(..) )
+import Data.Attoparsec.ByteString.Char8 as AC ()
+import Data.ByteString ( ByteString )
 import qualified Data.ByteString as BS
 import qualified Data.List as L
-import Data.Text as T
-import Data.Text.Encoding as TE
-import Data.Word (Word8)
+import Data.Text as T ( Text, concat, pack )
+import Data.Text.Encoding as TE ( encodeUtf8 )
 import Debug.Trace (trace)
 import Network.Socket
+    ( Socket,
+      HostName,
+      ServiceName,
+      defaultHints,
+      getAddrInfo,
+      openSocket,
+      AddrInfo(addrAddress, addrFlags, addrSocketType),
+      AddrInfoFlag(AI_PASSIVE),
+      SocketType(Stream),
+      setCloseOnExecIfNeeded,
+      withSocketsDo,
+      setSocketOption,
+      gracefulClose,
+      accept,
+      bind,
+      listen,
+      close,
+      withFdSocket,
+      SocketOption(ReuseAddr) )
 import Network.Socket.ByteString (recv, sendAll)
 import Parsers
+    ( Field(..),
+      Request(..),
+      Method(Get, Put, Post, Head, Delete, Connect),
+      parseHttp2Magic,
+      parseOrFeed,
+      parseReqFirst,
+      parseAllFields )
 
 someFunc :: IO ()
 someFunc = putStrLn "someFunc"
@@ -156,15 +180,11 @@ http2Server'' res msg s =
 
 checkClose :: [Field] -> Socket -> IO ()
 checkClose f s =
-  if (Prelude.any (== "close") $ findField f "connection")
-    then close s
-    else return ()
+  Control.Monad.when (elem "close" $ findField f "connection") $ close s
 
 checkUpgrade :: [Field] -> Socket -> Bool
 checkUpgrade f s =
-  if (Prelude.any (== "h2c") $ findField f "upgrade")
-    then trace "Upgrading" True
-    else False
+  elem "h2c" (findField f "upgrade") && trace "Upgrading" True
 
 findField :: [Field] -> Text -> [Text]
 findField f x = L.concat (L.map (\(Field _ v) -> v) . L.filter (\(Field n _) -> n == x) $ f)

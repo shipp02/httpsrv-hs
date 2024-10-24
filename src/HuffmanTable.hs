@@ -6,7 +6,9 @@ module HuffmanTable
    huffmanTable,
    huffmanTree,
    HuffmanTree(..),
-   Bit(..)
+   Bit(..),
+   bitToBool,
+   boolToBit,
 ) where
 
 import Data.List as L

@@ -1,6 +1,6 @@
 cabal-version: 1.12
 
--- This file has been generated from package.yaml by hpack version 0.34.4.
+-- This file has been generated from package.yaml by hpack version 0.37.0.
 --
 -- see: https://github.com/sol/hpack
 
@@ -25,6 +25,8 @@ source-repository head
 
 library
   exposed-modules:
+      Http2Output
+      Http2Types
       HuffmanTable
       Lib
       Parsers
@@ -41,6 +43,7 @@ library
     , base >=4.7 && <5
     , bv
     , bytestring
+    , mtl
     , network
     , text
   default-language: Haskell2010
@@ -59,6 +62,7 @@ executable httpsrv-exe
     , bv
     , bytestring
     , httpsrv
+    , mtl
     , network
     , text
   default-language: Haskell2010
@@ -78,6 +82,7 @@ test-suite httpsrv-test
     , bv
     , bytestring
     , httpsrv
+    , mtl
     , network
     , text
   default-language: Haskell2010

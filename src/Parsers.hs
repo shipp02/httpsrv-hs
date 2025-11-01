@@ -4,22 +4,25 @@
 
 module Parsers
   ( parseOrFeed,
-    parseReqFirst,
-    parseAllFields,
     parseAllValues,
     parseHttp2Magic,
+    parseHttp2Frame,
     Method (..),
     Request (..),
     Version (..),
     Field (..),
+    SettingParams,
+    RequestData(..),
     parseSettings,
     parseHeaders,
+    parseRequest,
   )
 where
 
 import ASCII.Char as ASCII (Char (Comma), toInt)
 import Data.Attoparsec.ByteString as AB
 import Data.Attoparsec.Char8 as AC
+    ( char, decimal, isEndOfLine, skipSpace, takeWhile, endOfLine )
 import qualified Data.BitVector as BV
 import Data.Bits
 import Data.ByteString as BS
@@ -28,6 +31,7 @@ import Data.Text as T
 import Data.Text.Encoding as TE
 import Data.Word (Word16, Word32, Word8)
 import Utils
+import Http2Types
 
 data Method
   = Get
@@ -48,7 +52,16 @@ toMethod _ = Get
 
 data Version = Version Int Int deriving (Show)
 
-data Request = Request Method Text Version deriving (Show)
+data Request = Request Text Version RequestData deriving (Show)
+
+data RequestData = 
+  GetRequest [Field] |
+  PutRequest [Field] ByteString |
+  PostRequest [Field] ByteString |
+  HeadRequest [Field] |
+  DeleteRequest [Field] |
+  ConnectRequest [Field]
+  deriving (Show)
 
 data Field = Field Text [Text] deriving (Show)
 
@@ -64,7 +77,7 @@ parseOrFeed ::
 parseOrFeed _ (Just partial) bs = feed partial bs
 parseOrFeed p Nothing bs = parse p bs
 
-parseReqFirst :: Parser Request
+parseReqFirst :: Parser (Method, Text, Version)
 parseReqFirst = do
   method <- AC.takeWhile (/= ' ')
   skipSpace
@@ -76,7 +89,19 @@ parseReqFirst = do
   _ <- char '.'
   vMinor <- decimal
   AC.endOfLine
-  return $ Request (toMethod method) (TE.decodeUtf8 target) (Version vMajor vMinor)
+  return (toMethod method, TE.decodeUtf8 target, Version vMajor vMinor)
+
+parseRequest :: Parser Request
+parseRequest = do
+  (method, target, version) <- parseReqFirst
+  fields <- parseAllFields []
+  return $ Request target version (case method of
+    Get -> GetRequest fields
+    Put -> PutRequest fields ""
+    Post -> PostRequest fields ""
+    Head -> HeadRequest fields
+    Delete -> DeleteRequest fields
+    Connect -> ConnectRequest fields)
 
 parseFieldLine :: Parser Field
 parseFieldLine = do
@@ -111,29 +136,6 @@ parseAllFields f =
         f' <- parseFieldLine
         parseAllFields (f' : f)
 
-data FrameType
-  = Data
-  | Headers
-  | Priority
-  | RstStream
-  | Settings
-  | PushPromise
-  | Ping
-  | GoAway
-  | WindowUpdate
-  | Continuation
-  deriving (Show, Eq)
-
-data Frame = Frame FrameType Word32 Word8 Word32 deriving (Show, Eq)
-
-data SettingParams
-  = HeaderTableSize
-  | EnablePush
-  | MaxConcurrentStreams
-  | InitialWindowSize
-  | MaxFrameSize
-  | MaxHeaderListSize
-  deriving (Show, Eq)
 
 w32 :: (Integral a) => a -> Word32
 w32 = fromIntegral
@@ -153,41 +155,18 @@ word32 = do
   d <- w32 <$> anyWord8
   return $ a .|. b .|. c .|. d
 
-parseHttp2Frame :: Parser Frame
+parseHttp2Frame :: Parser (FrameHdr, FrameType)
 parseHttp2Frame = do
   len <- word24
   typ <- anyWord8
   flags <- anyWord8
   id' <- word32
-  case typ of
-    0x00 -> return $ Frame Data id' flags len
-    -- DATA
-    0x01 -> do
-      let f = Frame Headers id' flags len
-      hf <- parseHeadersFlags f
-      _ <- parseHeaders f hf
-      return f
-    -- HEADERSS
-    0x02 -> return $ Frame Priority id' flags len
-    -- PRIORITY
-    0x03 -> return $ Frame RstStream id' flags len
-    -- RST_STREAM
-    0x04 -> return $ Frame Settings id' flags len
-    -- SETTINGS
-    0x05 -> return $ Frame PushPromise id' flags len
-    -- PUSH_PROMISE
-    0x06 -> return $ Frame Ping id' flags len
-    -- PING
-    0x07 -> return $ Frame GoAway id' flags len
-    -- GOAWAY
-    0x08 -> return $ Frame WindowUpdate id' flags len
-    -- WINDOW_UPDATE
-    0x09 -> return $ Frame Continuation id' flags len
-    -- CONTINUATION
-    _ -> return $ Frame Data id' flags len
+  let f = FrameHdr id' flags len
+  return (f, byteToFrameType typ)
 
-parseData :: Frame -> Parser ()
-parseData (Frame _ id flags len) =
+
+parseData :: FrameHdr -> Parser ()
+parseData (FrameHdr id flags len) =
   if flags `testBit` 3
     then do
       padlen <- fromIntegral <$> AB.anyWord8
@@ -206,12 +185,12 @@ data HeadersFlags = HeadersFlags
   }
   deriving (Show, Eq)
 
-parseHeadersFlags :: Frame -> Parser HeadersFlags
-parseHeadersFlags (Frame _ _ flags _) = do
+parseHeadersFlags :: FrameHdr -> Parser HeadersFlags
+parseHeadersFlags (FrameHdr _ flags _) = do
   return $ HeadersFlags (flags `testBit` 5) (flags `testBit` 3) (flags `testBit` 2) (flags `testBit` 0)
 
-parseHeaders :: Frame -> HeadersFlags -> Parser ByteString
-parseHeaders (Frame _ id flags len) HeadersFlags {..} =
+parseHeaders :: FrameHdr -> HeadersFlags -> Parser ByteString
+parseHeaders (FrameHdr id flags len) HeadersFlags {..} =
   do
     padlen <- if padded then fromIntegral <$> AB.anyWord8 else return 0
     _ <- AB.take padlen
@@ -273,29 +252,32 @@ setBits n =
       setBits' n' w = setBits' (n' - 1) (setBit w n')
    in setBits' (n - 1) 0
 
-parsePriority :: Frame -> Parser ()
-parsePriority (Frame _ id flags len) =
+parsePriority :: FrameHdr -> Parser ()
+parsePriority (FrameHdr id flags len) =
   do
     sdep <- fromIntegral . BV.uint . fromByteString <$> AB.take 4
     weight <- fromIntegral <$> AB.anyWord8
     return ()
 
-parseRstStream :: Frame -> Parser ()
-parseRstStream (Frame _ id flags len) =
+parseRstStream :: FrameHdr -> Parser ()
+parseRstStream (FrameHdr id flags len) =
   do
     ec <- fromIntegral . BV.uint . fromByteString <$> AB.take 4
     return ()
 
-parseSettings :: Frame -> Parser (Bool, [(SettingParams, Word32)])
-parseSettings (Frame _ id flags len) =
+parseSettings :: FrameHdr -> Parser (Bool, [(SettingParams, Word32)])
+parseSettings (FrameHdr id flags len) =
   do
     ack <- if flags `testBit` 0 then return True else return False
     ss <- settings_ 0 [] (fromIntegral len)
     return (ack, ss)
 
 -- Basic test code
--- >>> let Done _ res = parse (parseSettings (Frame Settings 0 0 18)) (TE.encodeUtf8 "\x00\x03\x00\x00\x00\x64\x00\x04\x40\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x12\x04\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x64\x00\x04\x40\x00\x00\x00\x00\x02\x00\x00\x00\x00")
+-- >>> let Done _ (ack, res) = parse (parseSettings (FrameHdr 0 0 18)) (TE.encodeUtf8 "\x00\x03\x00\x00\x00\x64\x00\x04\x40\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x12\x04\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x64\x00\x04\x40\x00\x00\x00\x00\x02\x00\x00\x00\x00")
 -- >>> res == [(MaxConcurrentStreams,100),(InitialWindowSize,1073741824),(EnablePush,0)]
+-- >>> ack
+-- True
+-- False
 parseSetting :: Parser (SettingParams, Word32)
 parseSetting =
   do
@@ -321,11 +303,11 @@ settingParam x = case x of
   0x06 -> MaxHeaderListSize
 
 -- Just takes len bytes
-parseAny :: Frame -> Parser ()
-parseAny (Frame _ _ _ len) = AB.take (fromIntegral len) >> return ()
+parseAny :: FrameHdr -> Parser ()
+parseAny (FrameHdr _ _ len) = AB.take (fromIntegral len) >> return ()
 
-parseWindowUpdate :: Frame -> Parser ()
-parseWindowUpdate (Frame _ id flags len) =
+parseWindowUpdate :: FrameHdr -> Parser ()
+parseWindowUpdate (FrameHdr id flags len) =
   do
     winincr <- fromIntegral . BV.uint . fromByteString <$> AB.take 4
     return ()
